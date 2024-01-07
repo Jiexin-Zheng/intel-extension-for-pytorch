@@ -95,6 +95,8 @@ target_compile_options(intel-ext-pt-gpu PRIVATE ${IPEX_SYCL_KERNEL_FLAGS})
 target_link_directories(intel-ext-pt-gpu PUBLIC ${SYCL_LIBRARY_DIR})
 target_link_options(intel-ext-pt-gpu PRIVATE ${IPEX_SYCL_LINK_FLAGS})
 
+target_include_directories(intel-ext-pt-gpu PUBLIC ${PYTHON_INCLUDE_DIR})
+
 add_dependencies(intel-ext-pt-gpu IPEX_GPU_GEN_TARGET)
 include(${PROJECT_SOURCE_DIR}/cmake/ClangFormat.cmake)
 if(CLANG_FORMAT)

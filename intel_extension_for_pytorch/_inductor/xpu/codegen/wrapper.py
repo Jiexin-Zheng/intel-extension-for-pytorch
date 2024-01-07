@@ -67,7 +67,11 @@ class XPUTritonWrapperCodeGen(WrapperCodeGen):
                 from torch import empty_strided, device
                 from {codecache.__name__} import XPUAsyncCompile
                 from torch._inductor.select_algorithm import extern_kernels
-
+                from intel_extension_for_pytorch._inductor.xpu.fx_passes.onednn_graph_fusion import oneDNN_Graph_fusion_ops
+                global_dict = globals()
+                for name, value in oneDNN_Graph_fusion_ops.items():
+                   global_dict[name] = value
+                
                 aten = torch.ops.aten
                 assert_size_stride = torch._C._dynamo.guards.assert_size_stride
                 reinterpret_tensor = torch.ops.inductor._reinterpret_tensor
@@ -255,3 +259,10 @@ class XPUTritonWrapperCodeGen(WrapperCodeGen):
                     f"compiled_module_main('{get_benchmark_name()}', benchmark_compiled_module)",
                 ]
             )
+
+    # Since oneDNN Graph kernels may not have origin node available, this method is
+    # the equivalent function to generate_extern_kernel_alloc() for oneDNN Graph kernels
+    def generate_oneDNN_Graph_kernel_alloc(self, extern_kernel_name, kernel, args):
+        self.writeline(
+            f"{self.declare}{extern_kernel_name} = {kernel}({', '.join(args)}){self.ending}"
+        )

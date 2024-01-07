@@ -21,6 +21,8 @@
 
 #include <thread>
 
+#include <oneDNN/python_bindings.h>
+
 #define ASSERT_TRUE(cmd) \
   if (!(cmd))            \
   return
@@ -619,6 +621,7 @@ at::Scalar scalar_slow(PyObject* object) {
 }
 
 void init_xpu_module(pybind11::module& m) {
+  onednn::initOnednnGraphPythonBindings(m);
   // For Runtime API, still use pybind
   m.def("_synchronize", [](const int& device_index) {
     xpu::dpcpp::deviceSynchronize(device_index);
