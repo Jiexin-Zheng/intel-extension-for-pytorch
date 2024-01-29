@@ -168,10 +168,12 @@ class oneDNNGraphManager:
                     op.set_attr(getattr(onednn_graph.op, attr_key), kwargs[attr_key])
             else:
                 op.set_attr(attr_key, kwargs[attr_key])
+        if op_kind == onednn_graph.op.Concat:
+            inputs = inputs[0]
         op.add_inputs(inputs)
         if outputs:
             op.add_outputs(outputs)
-        self.graph.add_op(op, True)
+        self.graph.add_op(op, False)
         return id
 
     def generate_id(self):
@@ -331,6 +333,9 @@ onednn_graph_intensive_ops = [
     aten.max_pool2d.default,
     aten.max_pool3d.default,
     aten.mm.default,
+    #aten.native_batch_norm.default,
+    aten.native_layer_norm.default,
+    aten.cat.default,
 ]
 
 
@@ -815,6 +820,18 @@ def allow_manydim_bmm(gm: GraphModule):
             valid_match &= node.args[0].meta["val"].shape[-2:] == torch.Size(
                 node.args[1][-2:]
             )
+        if(valid_match == False):
+            return valid_match
+        # To make it run into a 3-dim bmm kernel in oneDNN when the original bmm
+        # input n-dim is 5 and its first dim is 1, since this kind of case 
+        # always runs into a ref kernel on GPU. (tmp fix for hf_Reformer and 
+        # hf_BigBird, etc.)
+        # [1, 12, 64, 64, 128] --> [768, 64, 128]
+        not_redundant_five_dims = True
+        for node in [after_view_node, before_view_node0, before_view_node1]:
+            not_redundant_five_dims &= not ( (node.args[0].meta["val"].shape[0] == 1) and
+                (len(node.args[0].meta["val"].shape) == 5))
+        valid_match = not_redundant_five_dims and valid_match
         return valid_match
 
     matches = []
@@ -1090,6 +1107,20 @@ _lowerings_map = {
     ),
     aten.mm: LoweringConfig(onednn_graph.op.MatMul),
     aten.mul: LoweringConfig(onednn_graph.op.Multiply, scalar_in_descs=True),
+    # # Jiexin: Only mapped BatchNormInference currently, need to add trainning 
+    # # case in future
+    # aten.native_batch_norm: LoweringConfig(onednn_graph.op.BatchNormInference, 
+    #     lambda in_descs: in_descs[0:6],
+    #     attribute_inputs={onednn_graph.op.epsilon: lambda in_descs: in_descs[-1]}),
+    aten.native_layer_norm: LoweringConfig(onednn_graph.op.LayerNorm, 
+        lambda in_descs: [in_descs[0], in_descs[2], in_descs[3]],
+        attribute_inputs={onednn_graph.op.epsilon: lambda in_descs: in_descs[-1],
+            onednn_graph.op.begin_norm_axis: lambda in_descs: in_descs[1]},),
+    aten.cat: LoweringConfig(
+        onednn_graph.op.Concat,
+        lambda in_descs: in_descs[:-1],
+        attribute_inputs={onednn_graph.op.axis: lambda in_descs: in_descs[-1]},
+    ),
     aten.permute: LoweringConfig(
         onednn_graph.op.StaticTranspose,
         "first",
