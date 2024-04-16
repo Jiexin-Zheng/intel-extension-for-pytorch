@@ -13,8 +13,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch._inductor.virtualized import ops
 from ..pattern_matcher import _register_lowering_pattern_post_grad_pre_pass
-
-ipex_xpu_enable_oneDNN_graph = True
+from torch._inductor import config
 
 """ conv_relu_fusion
 aten = torch.ops.aten
@@ -765,6 +764,6 @@ def _ipex_fusion_init():
 def _ipex_weight_pack_init():
     _register_weight_pack_pass()
 
-if not ipex_xpu_enable_oneDNN_graph:
+if not config.onednn_graph:
     _ipex_fusion_init()
     _ipex_weight_pack_init()
