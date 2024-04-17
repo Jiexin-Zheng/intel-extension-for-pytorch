@@ -13,6 +13,37 @@
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 #include <vector>
 
+#include "oneapi/dnnl/dnnl_graph_sycl.hpp"
+
+#ifndef UNUSED
+#define UNUSED(x) ((void)(x))
+#endif
+
+static inline void* sycl_malloc_wrapper(
+    size_t size,
+    size_t alignment,
+    const void* dev,
+    const void* ctx) {
+  return malloc_device(
+      size,
+      *static_cast<const ::sycl::device*>(dev),
+      *static_cast<const ::sycl::context*>(ctx));
+}
+
+static inline void sycl_free_wrapper(
+    void* ptr,
+    const void* device,
+    const void* context,
+    void* event) {
+  UNUSED(device);
+  if (event) {
+    auto sycl_deps_ptr = static_cast<::sycl::event*>(event);
+    sycl_deps_ptr->wait();
+  }
+  free(ptr, *static_cast<const ::sycl::context*>(context));
+}
+
+
 using namespace dnnl;
 using namespace xpu::dpcpp;
 
@@ -51,9 +82,17 @@ struct GpuEngineManager {
     int device_count = (int)xpu::dpcpp::device_count();
     TORCH_INTERNAL_ASSERT(device_count > 0);
     for (int i = 0; i < device_count; i++) {
+#if defined(USE_ONEDNN_GRAPH)   
+      dnnl::graph::allocator alloc = dnnl::graph::sycl_interop::make_allocator(
+      sycl_malloc_wrapper, sycl_free_wrapper);
+      engine_pool.push_back(
+      std::make_shared<dnnl::engine>(dnnl::graph::sycl_interop::make_engine_with_allocator(
+      dpcppGetRawDevice(i), dpcppGetDeviceContext(i), alloc)));   
+#else      
       engine_pool.push_back(
           std::make_shared<dnnl::engine>(dnnl::sycl_interop::make_engine(
               dpcppGetRawDevice(i), dpcppGetDeviceContext(i))));
+#endif 
     }
   }
   ~GpuEngineManager() {}
