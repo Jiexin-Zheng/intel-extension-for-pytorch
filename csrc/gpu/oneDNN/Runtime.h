@@ -12,6 +12,36 @@
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 #include <vector>
 
+#include <runtime/CachingDeviceAllocator.h>
+#include <runtime/Device.h>
+#include "oneapi/dnnl/dnnl_graph_sycl.hpp"
+
+#include <cstdlib>
+
+static inline void* sycl_malloc_func(
+    size_t size,
+    size_t alignment,
+    const void* dev,
+    const void* context) {
+  void* r = nullptr;
+  if (size != 0) {
+    const sycl::device* dev_ptr = static_cast<const sycl::device*>(dev);
+    DeviceId dev_id = xpu::dpcpp::dpcppGetDeviceIndex(*dev_ptr);
+    auto stream = xpu::dpcpp::getCurrentDPCPPStream(dev_id);
+    xpu::dpcpp::CachingDeviceAllocator::Instance()->malloc(
+        &r, size, &xpu::dpcpp::dpcppGetQueueFromStream(stream));
+  }
+  return r;
+}
+
+static inline void sycl_free_func(
+    void* buf,
+    const void* dev,
+    const void* context,
+    void* event) {
+  return xpu::dpcpp::CachingDeviceAllocator::Instance()->free(buf);
+}
+
 using namespace dnnl;
 using namespace xpu::dpcpp;
 
@@ -50,9 +80,21 @@ struct GpuEngineManager {
     int device_count = (int)xpu::dpcpp::device_count();
     TORCH_INTERNAL_ASSERT(device_count > 0);
     for (int i = 0; i < device_count; i++) {
-      engine_pool.push_back(
-          std::make_shared<dnnl::engine>(dnnl::sycl_interop::make_engine(
-              dpcppGetRawDevice(i), dpcppGetDeviceContext(i))));
+      const char* use_onednn_graph = std::getenv("USE_ONEDNN_GRAPH");
+      if (use_onednn_graph == nullptr ||
+          std::strcmp(use_onednn_graph, "0") == 0) {
+        engine_pool.push_back(
+            std::make_shared<dnnl::engine>(dnnl::sycl_interop::make_engine(
+                dpcppGetRawDevice(i), dpcppGetDeviceContext(i))));
+      } else {
+        dnnl::graph::allocator alloc =
+            dnnl::graph::sycl_interop::make_allocator(
+                sycl_malloc_func, sycl_free_func);
+
+        engine_pool.push_back(std::make_shared<dnnl::engine>(
+            dnnl::graph::sycl_interop::make_engine_with_allocator(
+                dpcppGetRawDevice(i), dpcppGetDeviceContext(i), alloc)));
+      }
     }
   }
   ~GpuEngineManager() {}

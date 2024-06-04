@@ -21,9 +21,485 @@
 #include "sdp_utils.h"
 #include "utils/CustomOperatorRegistration.h"
 
+#include <omp.h>
+#include <cstdlib>
+#include "Graph.hpp"
+#include "aten/core/Device.h"
+#include "oneDNN/Runtime.h"
+#include "oneapi/dnnl/dnnl_graph.hpp"
+#include "oneapi/dnnl/dnnl_graph_sycl.hpp"
+
+#include <thread>
+
 using namespace torch::autograd;
 namespace at {
 namespace AtenIpexTypeXPU {
+
+using namespace onednn_graph;
+
+using stream = dnnl::stream;
+using logical_tensor = dnnl::graph::logical_tensor;
+using op = dnnl::graph::op;
+using graph = dnnl::graph::graph;
+using partition = dnnl::graph::partition;
+using compiled_partition = dnnl::graph::compiled_partition;
+using tensor = dnnl::graph::tensor;
+
+void allocate_sycl_graph_mem(
+    std::vector<tensor>& tensors,
+    const logical_tensor& lt,
+    const engine& eng,
+    const Tensor& input) {
+  tensor new_ts{lt, eng, input.data_ptr()};
+  tensors.push_back(new_ts);
+}
+
+std::vector<partition> graph_building_and_partitioning(
+    int batch_size,
+    int seq_len_q,
+    int seq_len_k,
+    int num_head,
+    int size_per_head,
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const Tensor& attn_mask,
+    const Tensor& output,
+    data_type dtype,
+    bool query_requires_transpose = false,
+    bool key_requires_transpose_twice = false,
+    bool key_requires_transpose_once = false,
+    bool value_requires_transpose = false,
+    bool apply_mask_before_scale = false,
+    bool choose_causal_mask_over_attn_score = false) {
+  // graph building and partitioning
+  // currently, we assume that Q and K have same sequence length
+  int seq_len = seq_len_q;
+
+  int head_dim = size_per_head * num_head;
+  dims qkv_input_shape = {batch_size, num_head, seq_len, size_per_head};
+  dims qk_output_shape = {batch_size, num_head, seq_len, seq_len};
+  dims scale_shape = {1};
+  dims attention_mask_shape;
+  dims qkv_transpose_order;
+  dims qkv_transposed_shape;
+  dims qkv_reshaped_shape;
+  if (apply_mask_before_scale) {
+    attention_mask_shape = {attn_mask.sizes().vec()};
+    qkv_transpose_order = {0, 1, 2, 3};
+    qkv_transposed_shape = {batch_size, num_head, seq_len, size_per_head};
+    qkv_reshaped_shape = {batch_size, num_head, seq_len, size_per_head};
+  }
+
+  size_t lt_id = 0;
+
+  logical_tensor query_input{
+      lt_id++, dtype, qkv_input_shape, query.strides().vec()};
+  logical_tensor key_input{
+      lt_id++, dtype, qkv_input_shape, key.strides().vec()};
+
+  logical_tensor matmul_qk_out{
+      lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
+  op matmul_qk{
+      0,
+      op::kind::MatMul,
+      {query_input, key_input},
+      {matmul_qk_out},
+      "matmul_qk"};
+  matmul_qk.set_attr<bool>(op::attr::transpose_b, true);
+
+  logical_tensor scale_factor{
+      lt_id++,
+      dtype,
+      scale_shape,
+      logical_tensor::layout_type::strided,
+      logical_tensor::property_type::constant};
+  logical_tensor scaled_qk_out{
+      lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
+  op scale_div{
+      1,
+      op::kind::Divide,
+      {matmul_qk_out, scale_factor},
+      {scaled_qk_out},
+      "scale_div"};
+
+  logical_tensor attention_mask{
+      lt_id++, dtype, attention_mask_shape, attn_mask.strides().vec()};
+  logical_tensor masked_qk_out{
+      lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
+  op mask_add{
+      2,
+      op::kind::Add,
+      {scaled_qk_out, attention_mask},
+      {masked_qk_out},
+      "mask_add"};
+
+  op softmax{3, op::kind::SoftMax, "softmax"};
+  softmax.set_attr<int64_t>(op::attr::axis, -1);
+
+  logical_tensor softmax_out{
+      lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
+  if (apply_mask_before_scale) {
+    softmax.add_input(masked_qk_out);
+  } else {
+    softmax.add_input(scaled_qk_out);
+  }
+  softmax.add_output(softmax_out);
+
+  logical_tensor value_input{
+      lt_id++, dtype, qkv_input_shape, value.strides().vec()};
+  logical_tensor matmul_v_out{
+      lt_id++, dtype, qkv_input_shape, output.strides().vec()};
+
+  op matmul_v{
+      4,
+      op::kind::MatMul,
+      {softmax_out, value_input},
+      {matmul_v_out},
+      "matmul_v"};
+
+  engine::kind ekind = engine::kind::gpu;
+  graph g(ekind);
+  g.add_op(matmul_qk);
+  g.add_op(scale_div);
+  if (apply_mask_before_scale) {
+    g.add_op(mask_add);
+  }
+  g.add_op(softmax);
+  g.add_op(matmul_v);
+  g.finalize();
+
+  return g.get_partitions();
+}
+
+// (TODO:Jiexin)Refine the cache part.
+void gpu_float_sdpa_with_cache(
+    int batch_size,
+    int seq_len_q,
+    int seq_len_k,
+    int num_head,
+    int size_per_head,
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const Tensor& attn_mask,
+    const float& softmax_scale,
+    const Tensor& output,
+    bool query_requires_transpose = false,
+    bool key_requires_transpose_twice = false,
+    bool key_requires_transpose_once = false,
+    bool value_requires_transpose = false,
+    bool apply_mask_before_scale = false,
+    bool choose_causal_mask_over_attn_score = false) {
+  auto eng = xpu::oneDNN::GpuEngineManager::Instance().get_engine(
+      {kXPU, current_device()});
+  auto strm = xpu::oneDNN::GpuStreamManager::Instance().get_stream();
+
+  data_type dtype = data_type::undef;
+
+  Tensor softmax_scale1 = full(
+      {},
+      1 / softmax_scale,
+      TensorOptions().dtype(c10::ScalarType::Half).device(DeviceType::XPU));
+
+  // cache key creation
+  // patternID is determined on the basis of the arguments provided
+  std::bitset<32> patternID;
+  if (query.scalar_type() == c10::ScalarType::Float) {
+    // bit 3 corresponds to float32 dtype
+    patternID.set(3, 1);
+    dtype = data_type::f32;
+  } else {
+    // bit 2 corresponds to float16 dtype
+    patternID.set(2, 1);
+    dtype = data_type::f16;
+  }
+  // sdp pattern
+  patternID.set(4, 1);
+  // Refer to comments in Graph.cpp. The first 8 bits are reserved
+  int pos = 8;
+
+  patternID.set(pos++, query_requires_transpose);
+  patternID.set(pos++, key_requires_transpose_twice);
+  patternID.set(pos++, key_requires_transpose_once);
+  patternID.set(pos++, value_requires_transpose);
+  patternID.set(pos++, apply_mask_before_scale);
+  patternID.set(pos++, choose_causal_mask_over_attn_score);
+  // first check cache
+  // The key has a pattern ID, as well as the shapes of input tenors
+  std::vector<int64_t> map_key;
+  map_key.reserve(1024);
+  // We use this because different thread-pools may be used
+  map_key.push_back(omp_get_max_threads());
+
+  map_key.push_back(static_cast<int64_t>(patternID.to_ullong()));
+
+  map_key.insert(map_key.end(), key.sizes().begin(), key.sizes().end());
+  map_key.insert(map_key.end(), query.sizes().begin(), query.sizes().end());
+  map_key.insert(map_key.end(), value.sizes().begin(), value.sizes().end());
+  map_key.insert(
+      map_key.end(),
+      softmax_scale1.sizes().begin(),
+      softmax_scale1.sizes().end());
+  auto iter = cache_lookup(map_key);
+
+  if (iter == cache_end()) {
+    // compiled partition cache no hit
+    cp_entry compiledPartitionEntry;
+    auto graph_partition_iter = partition_map_lookup(patternID);
+    partition graph_partition;
+    if (graph_partition_iter == partition_map_end()) {
+      // partition cache no hit
+      TORCH_CHECK(
+          ((dtype == data_type::f16) || (dtype == data_type::f32)),
+          "Only F16 & FP32 datatypes are currently supported");
+      // graph building and partitioning
+      std::vector<partition> partitions = graph_building_and_partitioning(
+          batch_size,
+          seq_len_q,
+          seq_len_k,
+          num_head,
+          size_per_head,
+          query,
+          key,
+          value,
+          attn_mask,
+          output,
+          dtype,
+          query_requires_transpose,
+          key_requires_transpose_twice,
+          key_requires_transpose_once,
+          value_requires_transpose,
+          apply_mask_before_scale,
+          choose_causal_mask_over_attn_score);
+
+      assert(partitions.size() == 1);
+      partition sdp_partition = partitions[0];
+      insert_in_partition_cache(patternID, sdp_partition);
+      graph_partition_iter = partition_map_lookup(patternID);
+    }
+
+    graph_partition = graph_partition_iter->second;
+    compiledPartitionEntry.partition_ = graph_partition;
+    // partition compilation
+    compile_partition(compiledPartitionEntry, eng);
+
+    // partition execution
+    auto& inputs = compiledPartitionEntry.inputLogicalTensors_;
+    auto& outputs = compiledPartitionEntry.outputLogicalTensors_;
+    compiledPartitionEntry.inputLLGATensors_.reserve(inputs.size());
+    compiledPartitionEntry.outputLLGATensors_.reserve(outputs.size());
+    allocate_sycl_graph_mem(
+        compiledPartitionEntry.inputLLGATensors_, inputs[0], eng, query);
+    allocate_sycl_graph_mem(
+        compiledPartitionEntry.inputLLGATensors_, inputs[1], eng, key);
+    allocate_sycl_graph_mem(
+        compiledPartitionEntry.inputLLGATensors_,
+        inputs[2],
+        eng,
+        softmax_scale1);
+    if (apply_mask_before_scale) {
+      allocate_sycl_graph_mem(
+          compiledPartitionEntry.inputLLGATensors_, inputs[3], eng, attn_mask);
+      allocate_sycl_graph_mem(
+          compiledPartitionEntry.inputLLGATensors_, inputs[4], eng, value);
+    }
+    allocate_sycl_graph_mem(
+        compiledPartitionEntry.inputLLGATensors_, inputs[3], eng, value);
+    allocate_sycl_graph_mem(
+        compiledPartitionEntry.outputLLGATensors_, outputs[0], eng, output);
+    compiledPartitionEntry.cp_.execute(
+        strm,
+        compiledPartitionEntry.inputLLGATensors_,
+        compiledPartitionEntry.outputLLGATensors_);
+    // cache the compiled kernel
+    insert_in_fused_kernel_cache(map_key, compiledPartitionEntry);
+
+  } else {
+    cp_entry& cp = iter->second->second;
+
+    // partition execution
+    auto& inputs = cp.inputLogicalTensors_;
+    auto& outputs = cp.outputLogicalTensors_;
+    cp.inputLLGATensors_.clear();
+    cp.outputLLGATensors_.clear();
+    allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[0], eng, query);
+    allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[1], eng, key);
+    allocate_sycl_graph_mem(
+        cp.inputLLGATensors_, inputs[2], eng, softmax_scale1);
+    if (apply_mask_before_scale) {
+      allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[3], eng, attn_mask);
+      allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[4], eng, value);
+    }
+    allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[3], eng, value);
+    allocate_sycl_graph_mem(cp.outputLLGATensors_, outputs[0], eng, output);
+    cp.cp_.execute(strm, cp.inputLLGATensors_, cp.outputLLGATensors_);
+  }
+}
+
+void gpu_float_sdpa(
+    int batch_size,
+    int seq_len_q,
+    int seq_len_k,
+    int num_head,
+    int size_per_head,
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const Tensor& attn_mask,
+    const float& softmax_scale,
+    const Tensor& output,
+    bool query_requires_transpose = false,
+    bool key_requires_transpose_twice = false,
+    bool key_requires_transpose_once = false,
+    bool value_requires_transpose = false,
+    bool apply_mask_before_scale = false,
+    bool choose_causal_mask_over_attn_score = false) {
+  auto eng = xpu::oneDNN::GpuEngineManager::Instance().get_engine(
+      {kXPU, current_device()});
+  auto strm = xpu::oneDNN::GpuStreamManager::Instance().get_stream();
+
+  data_type dtype = data_type::undef;
+
+  Tensor softmax_scale1 = full(
+      {},
+      1 / softmax_scale,
+      TensorOptions().dtype(c10::ScalarType::Half).device(DeviceType::XPU));
+
+  if (query.scalar_type() == c10::ScalarType::Float) {
+    dtype = data_type::f32;
+  } else {
+    dtype = data_type::f16;
+  }
+
+  TORCH_CHECK(
+      ((dtype == data_type::f16) || (dtype == data_type::f32)),
+      "Only F16 & FP32 datatypes are currently supported");
+  // graph building and partitioning
+  std::vector<partition> partitions = graph_building_and_partitioning(
+      batch_size,
+      seq_len_q,
+      seq_len_k,
+      num_head,
+      size_per_head,
+      query,
+      key,
+      value,
+      attn_mask,
+      output,
+      dtype,
+      query_requires_transpose,
+      key_requires_transpose_twice,
+      key_requires_transpose_once,
+      value_requires_transpose,
+      apply_mask_before_scale,
+      choose_causal_mask_over_attn_score);
+
+  assert(partitions.size() == 1);
+  partition sdp_partition = partitions[0];
+
+  std::vector<logical_tensor> inputs = sdp_partition.get_input_ports();
+  std::vector<logical_tensor> outputs = sdp_partition.get_output_ports();
+  compiled_partition cp = sdp_partition.compile(inputs, outputs, eng);
+
+  // partition execution
+  std::vector<tensor> inputs_ts, outputs_ts;
+  inputs_ts.reserve(inputs.size());
+  outputs_ts.reserve(outputs.size());
+  allocate_sycl_graph_mem(inputs_ts, inputs[0], eng, query);
+  allocate_sycl_graph_mem(inputs_ts, inputs[1], eng, key);
+  allocate_sycl_graph_mem(inputs_ts, inputs[2], eng, softmax_scale1);
+
+  if (apply_mask_before_scale) {
+    allocate_sycl_graph_mem(inputs_ts, inputs[3], eng, attn_mask);
+    allocate_sycl_graph_mem(inputs_ts, inputs[4], eng, value);
+  }
+  allocate_sycl_graph_mem(inputs_ts, inputs[3], eng, value);
+  allocate_sycl_graph_mem(outputs_ts, outputs[0], eng, output);
+
+  cp.execute(strm, inputs_ts, outputs_ts);
+}
+
+inline Tensor _scaled_dot_product_onednn_graph_dnnl_impl(
+    const Tensor& _query,
+    const Tensor& _key,
+    const Tensor& _value,
+    const c10::optional<Tensor>& attn_mask,
+    bool is_causal,
+    double dropout_p,
+    c10::optional<double> scale) {
+  auto output = at::empty_like(_query);
+  int batch_size = _query.size(0);
+  int num_head = _query.size(1);
+  int size_per_head = _query.size(3);
+  int seq_len_q = _query.size(2);
+  int seq_len_k = _key.size(2);
+
+  const double softmax_scale =
+      scale.has_value() ? scale.value() : (1.0 / std::sqrt(_query.size(-1)));
+
+  //(TODO:Jiexin) need to support more general sdp patterns
+  bool query_requires_transpose = false;
+  bool key_requires_transpose_twice = false;
+  bool key_requires_transpose_once = true;
+  bool value_requires_transpose = false;
+  bool apply_mask_before_scale = false;
+  bool choose_causal_mask_over_attn_score = false;
+
+  // need contiguous to get strided layout in broadcast case for large partition
+  // kernel
+  const Tensor attn_mask_final =
+      attn_mask.has_value() ? attn_mask.value() : at::empty_like(_query);
+  if (attn_mask.has_value()) {
+    apply_mask_before_scale = true;
+  }
+
+  const char* enable_onednn_graph_cache =
+      std::getenv("ENABLE_ONEDNN_GRAPH_CACHE");
+  if (enable_onednn_graph_cache == nullptr ||
+      (enable_onednn_graph_cache != nullptr &&
+       std::strcmp(enable_onednn_graph_cache, "0") != 0)) {
+    gpu_float_sdpa_with_cache(
+        batch_size,
+        seq_len_q,
+        seq_len_k,
+        num_head,
+        size_per_head,
+        _query,
+        _key,
+        _value,
+        attn_mask_final,
+        softmax_scale,
+        output,
+        query_requires_transpose,
+        key_requires_transpose_twice,
+        key_requires_transpose_once,
+        value_requires_transpose,
+        apply_mask_before_scale,
+        choose_causal_mask_over_attn_score);
+  } else {
+    gpu_float_sdpa(
+        batch_size,
+        seq_len_q,
+        seq_len_k,
+        num_head,
+        size_per_head,
+        _query,
+        _key,
+        _value,
+        attn_mask_final,
+        softmax_scale,
+        output,
+        query_requires_transpose,
+        key_requires_transpose_twice,
+        key_requires_transpose_once,
+        value_requires_transpose,
+        apply_mask_before_scale,
+        choose_causal_mask_over_attn_score);
+  }
+
+  return output;
+}
 
 std::tuple<Tensor, Tensor, Tensor, Tensor> ipex_sdp_dropout_backward(
     const Tensor& grad_out,
@@ -415,24 +891,35 @@ _scaled_dot_product_efficient_attention(
       {query.size(0), query.size(1), query.size(2)},
       query.options().dtype(at::kFloat));
 
-  auto out = _scaled_dot_product_efficient_attention_impl(
-      query,
-      key,
-      value,
-      attn_bias,
-      c10::nullopt,
-      seed_t,
-      offset_t,
-      softmax_lse,
-      is_causal,
-      compute_log_sumexp,
-      dropout_p,
-      scale);
-  return std::make_tuple(
-      std::move(out),
-      std::move(softmax_lse),
-      std::move(seed_t),
-      std::move(offset_t));
+  const char* use_onednn_graph = std::getenv("USE_ONEDNN_GRAPH");
+  if (use_onednn_graph == nullptr || std::strcmp(use_onednn_graph, "0") == 0) {
+    auto out = _scaled_dot_product_efficient_attention_impl(
+        query,
+        key,
+        value,
+        attn_bias,
+        c10::nullopt,
+        seed_t,
+        offset_t,
+        softmax_lse,
+        is_causal,
+        compute_log_sumexp,
+        dropout_p,
+        scale);
+    return std::make_tuple(
+        std::move(out),
+        std::move(softmax_lse),
+        std::move(seed_t),
+        std::move(offset_t));
+  } else {
+    auto out = _scaled_dot_product_onednn_graph_dnnl_impl(
+        query, key, value, attn_bias, is_causal, dropout_p, scale);
+    return std::make_tuple(
+        std::move(out),
+        std::move(softmax_lse),
+        std::move(seed_t),
+        std::move(offset_t));
+  }
 }
 
 std::tuple<Tensor, Tensor, Tensor> ipex_sdp_dropout_forward(

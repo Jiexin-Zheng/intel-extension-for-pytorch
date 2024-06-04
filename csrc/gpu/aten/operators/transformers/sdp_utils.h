@@ -399,6 +399,10 @@ inline bool check_last_dim_stride_equals_1(sdp_params params) {
 
 inline bool use_mem_efficient_attention(sdp::sdp_params params) {
   //  Define gate functions that determine if a flash kernel can be ran
+  const char* use_onednn_graph = std::getenv("USE_ONEDNN_GRAPH");
+  if (use_onednn_graph != nullptr && std::strcmp(use_onednn_graph, "0") != 0) {
+    return true;
+  }
   constexpr auto constraints = sdp::array_of<bool (*)(sdp::sdp_params)>(
       sdp::xetla_supported,
       sdp::check_requires_grad_and_nested,

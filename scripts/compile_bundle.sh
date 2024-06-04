@@ -7,7 +7,7 @@ set -eo pipefail
 
 VER_IPEX=xpu-main
 
-if [[ $# -lt 5 ]]; then
+if [[ $# -lt 3 ]]; then
     echo "Usage: bash $0 <DPCPPROOT> <MKLROOT> <CCLROOT> <MPIROOT> <AOT>"
     echo "DPCPPROOT, MKLROOT, CCLROOT and MPIROOT are mandatory, should be absolute or relative path to the root directory of DPC++ compiler, oneMKL, oneCCL and Intel(R) MPI respectively."
     echo "AOT should be set to the text string for environment variable USE_AOT_DEVLIST. Setting it to \"none\" to disable AOT."
@@ -15,9 +15,9 @@ if [[ $# -lt 5 ]]; then
 fi
 DPCPP_ROOT=$1
 ONEMKL_ROOT=$2
-ONECCL_ROOT=$3
-MPI_ROOT=$4
-AOT=$5
+#ONECCL_ROOT=$3
+#MPI_ROOT=$4
+AOT=$3
 if [[ ${AOT} == "none" ]]; then
     AOT=""
 fi
@@ -32,7 +32,7 @@ fi
 #           | | └----------- Undefined
 #           | └------------- Undefined
 #           └--------------- Undefined
-MODE=0x07
+MODE=0x04
 if [ $# -gt 5 ]; then
     if [[ ! $6 =~ ^[0-9]+$ ]] && [[ ! $6 =~ ^0x[0-9a-fA-F]+$ ]]; then
         echo "Warning: Unexpected argument. Using default value."
@@ -54,17 +54,17 @@ if [ ! -f ${ONEMKL_ENV} ]; then
     exit 3
 fi
 
-CCL_ENV=${ONECCL_ROOT}/env/vars.sh
-if [ ! -f ${ONECCL_ROOT}/env/vars.sh ]; then
-    echo "oneCCL environment ${ONECCL_ROOT} doesn't seem to exist."
-    exit 4
-fi
+# CCL_ENV=${ONECCL_ROOT}/env/vars.sh
+# if [ ! -f ${ONECCL_ROOT}/env/vars.sh ]; then
+#     echo "oneCCL environment ${ONECCL_ROOT} doesn't seem to exist."
+#     exit 4
+# fi
 
-MPI_ENV=${MPI_ROOT}/env/vars.sh
-if [ ! -f ${MPI_ROOT}/env/vars.sh ]; then
-    echo "Intel(R) MPI environment ${MPI_ROOT} doesn't seem to exist."
-    exit 5
-fi
+# MPI_ENV=${MPI_ROOT}/env/vars.sh
+# if [ ! -f ${MPI_ROOT}/env/vars.sh ]; then
+#     echo "Intel(R) MPI environment ${MPI_ROOT} doesn't seem to exist."
+#     exit 5
+# fi
 ONEAPIROOT=${ONEMKL_ROOT}/../..
 
 # Check existance of required Linux commands
@@ -119,13 +119,14 @@ if [ ! -d intel-extension-for-pytorch ]; then
     git clone https://github.com/intel/intel-extension-for-pytorch.git intel-extension-for-pytorch
 fi
 cd intel-extension-for-pytorch
-if [ ! -z ${VER_IPEX} ]; then
-    rm -rf * > /dev/null
-    git checkout . > /dev/null
-    git checkout main > /dev/null
-    git pull > /dev/null
-    git checkout ${VER_IPEX}
-fi
+# zjx comments
+# if [ ! -z ${VER_IPEX} ]; then
+#     rm -rf * > /dev/null
+#     git checkout . > /dev/null
+#     git checkout main > /dev/null
+#     git pull > /dev/null
+#     git checkout ${VER_IPEX}
+# fi
 git submodule sync
 git submodule update --init --recursive
 
@@ -268,8 +269,8 @@ fi
 # don't fail on external scripts
 source ${DPCPP_ENV}
 source ${ONEMKL_ENV}
-source ${CCL_ENV}
-source ${MPI_ENV}
+# source ${CCL_ENV}
+# source ${MPI_ENV}
 #  TorchAudio
 if [ $((${MODE} & 0x02)) -ne 0 ]; then
     cd audio
