@@ -74,11 +74,11 @@ std::vector<partition> graph_building_and_partitioning(
     bool choose_causal_mask_over_attn_score = false) {
   // graph building and partitioning
   // currently, we assume that Q and K have same sequence length
-  int seq_len = seq_len_q;
 
   int head_dim = size_per_head * num_head;
-  dims qkv_input_shape = {batch_size, num_head, seq_len, size_per_head};
-  dims qk_output_shape = {batch_size, num_head, seq_len, seq_len};
+  dims q_input_shape = {batch_size, num_head, seq_len_q, size_per_head};
+  dims kv_input_shape = {batch_size, num_head, seq_len_k, size_per_head};
+  dims qk_output_shape = {batch_size, num_head, seq_len_q, seq_len_k};
   dims scale_shape = {1};
   dims attention_mask_shape;
   dims qkv_transpose_order;
@@ -86,17 +86,12 @@ std::vector<partition> graph_building_and_partitioning(
   dims qkv_reshaped_shape;
   if (apply_mask_before_scale) {
     attention_mask_shape = {attn_mask.sizes().vec()};
-    qkv_transpose_order = {0, 1, 2, 3};
-    qkv_transposed_shape = {batch_size, num_head, seq_len, size_per_head};
-    qkv_reshaped_shape = {batch_size, num_head, seq_len, size_per_head};
   }
-
   size_t lt_id = 0;
 
   logical_tensor query_input{
-      lt_id++, dtype, qkv_input_shape, query.strides().vec()};
-  logical_tensor key_input{
-      lt_id++, dtype, qkv_input_shape, key.strides().vec()};
+      lt_id++, dtype, q_input_shape, query.strides().vec()};
+  logical_tensor key_input{lt_id++, dtype, kv_input_shape, key.strides().vec()};
 
   logical_tensor matmul_qk_out{
       lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
@@ -147,9 +142,9 @@ std::vector<partition> graph_building_and_partitioning(
   softmax.add_output(softmax_out);
 
   logical_tensor value_input{
-      lt_id++, dtype, qkv_input_shape, value.strides().vec()};
+      lt_id++, dtype, kv_input_shape, value.strides().vec()};
   logical_tensor matmul_v_out{
-      lt_id++, dtype, qkv_input_shape, output.strides().vec()};
+      lt_id++, dtype, q_input_shape, output.strides().vec()};
 
   op matmul_v{
       4,
@@ -246,7 +241,7 @@ void gpu_float_sdpa_with_cache(
   if (iter == cache_end()) {
     // compiled partition cache no hit
     cp_entry compiledPartitionEntry;
-    auto graph_partition_iter = partition_map_lookup(patternID);
+    auto graph_partition_iter = partition_map_lookup(map_key);
     partition graph_partition;
     if (graph_partition_iter == partition_map_end()) {
       // partition cache no hit
@@ -275,8 +270,8 @@ void gpu_float_sdpa_with_cache(
 
       assert(partitions.size() == 1);
       partition sdp_partition = partitions[0];
-      insert_in_partition_cache(patternID, sdp_partition);
-      graph_partition_iter = partition_map_lookup(patternID);
+      insert_in_partition_cache(map_key, sdp_partition);
+      graph_partition_iter = partition_map_lookup(map_key);
     }
 
     graph_partition = graph_partition_iter->second;
@@ -434,7 +429,6 @@ inline Tensor _scaled_dot_product_onednn_graph_dnnl_impl(
   int size_per_head = _query.size(3);
   int seq_len_q = _query.size(2);
   int seq_len_k = _key.size(2);
-
   const double softmax_scale =
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(_query.size(-1)));
 
@@ -2473,4 +2467,12 @@ IPEX_LIBRARY_FRAGMENT() {
       at::AtenIpexTypeXPU::xetla_sdp_dropout,
       c10::DispatchKey::AutogradXPU);
 }
+
+IPEX_LIBRARY_FRAGMENT() {
+  IPEX_OP_REGISTER_DISPATCH(
+      "_scaled_dot_product_efficient_attention",
+      at::AtenIpexTypeXPU::_scaled_dot_product_efficient_attention,
+      c10::DispatchKey::XPU);
+}
+
 } // namespace

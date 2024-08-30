@@ -1,4 +1,5 @@
 import torch
+import math
 from torch.nn.modules.utils import _pair
 from torch import nn, Tensor
 from torch.jit.annotations import BroadcastingList2
@@ -15,6 +16,7 @@ __all__ = [
     "IpexSDP",
     "IpexSDP_Index",
     "IpexSDP_dropout",
+    "IpexOneDNNGraphSDP",
     "EMA",
     "clip_grad_norm_",
     "clip_grad_norm",
@@ -153,6 +155,27 @@ def IpexSDP_Index(
         beta,
         dropout_p,
         is_causal,
+    )
+
+def IpexOneDNNGraphSDP(
+    query,
+    key,
+    value,
+    attn_mask,
+    compute_log_sumexp=False,
+    dropout_p=0.0,
+    is_causal=False,
+    alpha=1.0,
+) -> Tensor:
+    return torch.ops.torch_ipex._scaled_dot_product_efficient_attention(
+        query,
+        key,
+        value,
+        attn_mask,
+        compute_log_sumexp,
+        dropout_p,
+        is_causal,
+        alpha,
     )
 
 

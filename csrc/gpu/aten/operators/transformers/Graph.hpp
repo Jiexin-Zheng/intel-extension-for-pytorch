@@ -64,14 +64,16 @@ using list_iterator_t = std::list<key_value_pair_t>::iterator;
 
 void insert_in_fused_kernel_cache(std::vector<int64_t>& map_key, cp_entry& cp);
 
-void insert_in_partition_cache(std::bitset<32>& partitionID, partition& p);
+void insert_in_partition_cache(
+    std::vector<int64_t>& partition_key,
+    partition& p);
 
 void change_pos_in_list(list_iterator_t& kvpair);
 
-std::unordered_map<std::bitset<32>, dnnl::graph::partition>::iterator
-partition_map_lookup(std::bitset<32>& patternID);
+std::unordered_map<std::vector<int64_t>, dnnl::graph::partition>::iterator
+partition_map_lookup(std::vector<int64_t>& partition_key);
 
-std::unordered_map<std::bitset<32>, dnnl::graph::partition>::iterator
+std::unordered_map<std::vector<int64_t>, dnnl::graph::partition>::iterator
 partition_map_end();
 
 std::unordered_map<std::vector<int64_t>, list_iterator_t>::iterator cache_lookup(

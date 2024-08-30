@@ -1,4 +1,5 @@
 import torch
+import os
 import intel_extension_for_pytorch as ipex  # noqa F401
 from .RoPE import apply_rotary_pos_emb
 
@@ -143,6 +144,7 @@ def qwen_sdp(self, query, key, value, attention_mask, head_mask, alibi):
     ):
         return self.naive_sdp(query, key, value, attention_mask, head_mask, alibi)
     key, value, key_prompt, value_prompt = self.sdp_kv_preprocess(key, value)
+    use_onednn_graph = os.getenv('USE_ONEDNN_GRAPH')
     (
         dropout,
         alpha,
@@ -150,7 +152,7 @@ def qwen_sdp(self, query, key, value, attention_mask, head_mask, alibi):
         is_casual,
         blocked_attn_mask,
         blocked_alibi,
-    ) = self.prepare_sdp_input(query, key, value, attention_mask, alibi)
+    ) = self.prepare_sdp_input(query, key, value, attention_mask, alibi, use_onednn_graph)
     attention_output, attn_weight = self.compute_sdp(
         query,
         key,
@@ -164,6 +166,7 @@ def qwen_sdp(self, query, key, value, attention_mask, head_mask, alibi):
         beta,
         dropout,
         is_casual,
+        use_onednn_graph,
     )
     attention_output = self.process_sdp_output(attention_output)
     attention_output = attention_output.reshape(

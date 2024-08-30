@@ -1,4 +1,5 @@
 import torch
+import os
 import torch.nn as nn
 import torch.distributed as dist
 from .._transformer_configuration import IPEXTransformerConfig
@@ -238,6 +239,7 @@ class IPEXTransformerAttnOptimizedFp16(IPEXTransformerAttnNaive):
     # ################################################################ sdp ##############################################
 
     def sdp(self, query, key, value, attention_mask, head_mask, alibi):
+        use_onednn_graph = os.getenv('USE_ONEDNN_GRAPH')
         # Currently only PVC and MTL (without beam search) have sdp fusion available
         if not (
             torch.xpu.has_2d_block_array()
@@ -256,7 +258,7 @@ class IPEXTransformerAttnOptimizedFp16(IPEXTransformerAttnNaive):
             is_casual,
             blocked_attn_mask,
             blocked_alibi,
-        ) = self.prepare_sdp_input(query, key, value, attention_mask, alibi)
+        ) = self.prepare_sdp_input(query, key, value, attention_mask, alibi, use_onednn_graph)
         # q: (bs_beam, num_heads, q_len, head_dim), kv: (bs_beam, num_heads, seq_len, head_dim)
         attention_output, attn_weight = self.compute_sdp(
             query,
@@ -271,6 +273,7 @@ class IPEXTransformerAttnOptimizedFp16(IPEXTransformerAttnNaive):
             beta,
             dropout,
             is_casual,
+            use_onednn_graph,
         )
 
         attention_output = self.process_sdp_output(attention_output)
@@ -430,7 +433,7 @@ class IPEXTransformerAttnOptimizedFp16(IPEXTransformerAttnNaive):
 
         return attn_output, attn_weights
 
-    def prepare_sdp_input(self, query, key, value, attention_mask, alibi):
+    def prepare_sdp_input(self, query, key, value, attention_mask, alibi, use_onednn_graph):
         dropout = 0.0
         alpha = 1.0 / math.sqrt(self.head_dim)
         beta = 1.0
@@ -449,16 +452,18 @@ class IPEXTransformerAttnOptimizedFp16(IPEXTransformerAttnNaive):
                     is_causal = True
             else:
                 assert seq_len == attention_mask.size(-1)
-                blocked_attn_mask = self.get_blocked_attn_mask(
-                    attention_mask,
-                    seq_len,
-                )
+                if use_onednn_graph == "1" and not is_causal:
+                    blocked_attn_mask = attention_mask
+                else:
+                    blocked_attn_mask = self.get_blocked_attn_mask(
+                        attention_mask,
+                        seq_len,
+                    )
         blocked_alibi = None
         if alibi is not None:
             blocked_alibi = self.get_blocked_alibi(alibi, seq_len)
         if seq_len >= self.max_position:
             self.max_position = seq_len + self.runtime_cache_size
-
         return dropout, alpha, beta, is_causal, blocked_attn_mask, blocked_alibi
 
     def compute_sdp(
@@ -475,7 +480,10 @@ class IPEXTransformerAttnOptimizedFp16(IPEXTransformerAttnNaive):
         beta,
         dropout,
         is_causal,
+        use_onednn_graph,
     ):
+        if use_onednn_graph == "1" and is_causal == False:
+            return self.sdp_oneDNN_Graph(query,key,value,attention_mask,dropout,is_causal,alpha)
         if self.is_1st_token_beam_search():
             return self.sdp_1st_token_beam_search(
                 query,
@@ -522,6 +530,20 @@ class IPEXTransformerAttnOptimizedFp16(IPEXTransformerAttnNaive):
                 is_causal,
             )
 
+    def sdp_oneDNN_Graph(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout,
+        is_causal,
+        alpha
+    ):
+        compute_log_sumexp = False
+        attention_output = torch.xpu.IpexOneDNNGraphSDP(query,key,value,attention_mask,compute_log_sumexp,dropout,is_causal,alpha) 
+        return attention_output[0], None
+    
     def sdp_greedy_search(
         self,
         query,

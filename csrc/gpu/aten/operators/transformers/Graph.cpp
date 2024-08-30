@@ -7,7 +7,7 @@ namespace onednn_graph {
 
 // Thread local data-structures are required if multiple thread-pools
 // of a PyTorch process would be used for inference.
-thread_local std::unordered_map<std::bitset<32>, dnnl::graph::partition>
+thread_local std::unordered_map<std::vector<int64_t>, dnnl::graph::partition>
     partition_map_;
 // Compiled partition (fused kernel) cache
 // Adopted from
@@ -45,12 +45,12 @@ std::unordered_map<std::vector<int64_t>, list_iterator_t>::iterator cache_end() 
   return fused_kernel_cache_map_.end();
 }
 
-std::unordered_map<std::bitset<32>, dnnl::graph::partition>::iterator
-partition_map_lookup(std::bitset<32>& patternID) {
-  return partition_map_.find(patternID);
+std::unordered_map<std::vector<int64_t>, dnnl::graph::partition>::iterator
+partition_map_lookup(std::vector<int64_t>& partition_key) {
+  return partition_map_.find(partition_key);
 }
 
-std::unordered_map<std::bitset<32>, dnnl::graph::partition>::iterator
+std::unordered_map<std::vector<int64_t>, dnnl::graph::partition>::iterator
 partition_map_end() {
   return partition_map_.end();
 }
@@ -65,7 +65,7 @@ partition_map_end() {
 // The rest of the bits depend upon the arguments provided
 // However, down the line, we might have different bitsets for different
 // patterns
-void insert_in_partition_cache(std::bitset<32>& patternID, partition& p) {
+void insert_in_partition_cache(std::vector<int64_t>& patternID, partition& p) {
   partition_map_[patternID] = std::move(p);
 }
 
