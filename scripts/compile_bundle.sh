@@ -5,7 +5,7 @@
 #
 set -eo pipefail
 
-VER_IPEX=xpu-main
+VER_IPEX=jiexin-zheng/xpu/llga_sdpa
 
 if [[ $# -lt 3 ]]; then
     echo "Usage: bash $0 <DPCPPROOT> <MKLROOT> <CCLROOT> <MPIROOT> <AOT>"
@@ -116,7 +116,7 @@ cd ${BASEFOLDER}
 
 # Checkout individual components
 if [ ! -d intel-extension-for-pytorch ]; then
-    git clone https://github.com/intel/intel-extension-for-pytorch.git intel-extension-for-pytorch
+    git clone https://github.com/Jiexin-Zheng/intel-extension-for-pytorch.git intel-extension-for-pytorch
 fi
 cd intel-extension-for-pytorch
 # zjx comments
