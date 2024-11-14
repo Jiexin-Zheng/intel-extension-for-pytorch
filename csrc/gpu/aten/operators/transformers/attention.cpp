@@ -23,13 +23,13 @@
 
 #include <omp.h>
 #include <cstdlib>
+#include <limits>
+#include <thread>
 #include "Graph.hpp"
 #include "aten/core/Device.h"
 #include "oneDNN/Runtime.h"
 #include "oneapi/dnnl/dnnl_graph.hpp"
 #include "oneapi/dnnl/dnnl_graph_sycl.hpp"
-
-#include <thread>
 
 using namespace torch::autograd;
 namespace at {
@@ -69,7 +69,7 @@ std::vector<partition> graph_building_and_partitioning(
     bool query_requires_transpose = false,
     bool key_requires_transpose_twice = false,
     bool key_requires_transpose_once = false,
-    bool value_requires_transpose = false,
+    bool has_bool_mask = false,
     bool apply_mask_before_scale = false,
     bool choose_causal_mask_over_attn_score = false) {
   // graph building and partitioning
@@ -84,10 +84,11 @@ std::vector<partition> graph_building_and_partitioning(
   dims qkv_transpose_order;
   dims qkv_transposed_shape;
   dims qkv_reshaped_shape;
-  if (apply_mask_before_scale) {
+  if (apply_mask_before_scale && !has_bool_mask) {
     attention_mask_shape = {attn_mask.sizes().vec()};
   }
   size_t lt_id = 0;
+  size_t op_id = 0;
 
   logical_tensor query_input{
       lt_id++, dtype, q_input_shape, query.strides().vec()};
@@ -96,7 +97,7 @@ std::vector<partition> graph_building_and_partitioning(
   logical_tensor matmul_qk_out{
       lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
   op matmul_qk{
-      0,
+      op_id++,
       op::kind::MatMul,
       {query_input, key_input},
       {matmul_qk_out},
@@ -112,30 +113,64 @@ std::vector<partition> graph_building_and_partitioning(
   logical_tensor scaled_qk_out{
       lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
   op scale_div{
-      1,
+      op_id++,
       op::kind::Divide,
       {matmul_qk_out, scale_factor},
       {scaled_qk_out},
       "scale_div"};
 
-  logical_tensor attention_mask{
-      lt_id++, dtype, attention_mask_shape, attn_mask.strides().vec()};
-  logical_tensor masked_qk_out{
-      lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
-  op mask_add{
-      2,
-      op::kind::Add,
-      {scaled_qk_out, attention_mask},
-      {masked_qk_out},
-      "mask_add"};
+  c10::optional<logical_tensor> attention_mask = c10::nullopt;
+  c10::optional<logical_tensor> masked_qk_out = c10::nullopt;
+  c10::optional<logical_tensor> negative_inf = c10::nullopt;
+  c10::optional<logical_tensor> selected_out = c10::nullopt;
+  c10::optional<op> select_mask = c10::nullopt;
+  c10::optional<op> mask_add = c10::nullopt;
 
-  op softmax{3, op::kind::SoftMax, "softmax"};
+  if (has_bool_mask) {
+    logical_tensor attention_mask_tmp{
+        lt_id++,
+        data_type::boolean,
+        attention_mask_shape,
+        attn_mask.strides().vec()};
+    attention_mask = std::move(attention_mask_tmp);
+    logical_tensor negative_inf_tmp{
+        lt_id++, dtype, attention_mask_shape, attn_mask.strides().vec()};
+    negative_inf = std::move(negative_inf_tmp);
+    logical_tensor selected_out_tmp{
+        lt_id++, dtype, qk_output_shape, attn_mask.strides().vec()};
+    selected_out = std::move(selected_out_tmp);
+    op select_mask_tmp{
+        op_id++,
+        op::kind::Select,
+        {attention_mask.value(), negative_inf.value(), scaled_qk_out},
+        {selected_out.value()},
+        "select_mask"};
+    select_mask = std::move(select_mask_tmp);
+  } else if (apply_mask_before_scale && !has_bool_mask) {
+    logical_tensor attention_mask_tmp{
+        lt_id++, dtype, attention_mask_shape, attn_mask.strides().vec()};
+    attention_mask = std::move(attention_mask_tmp);
+    logical_tensor masked_qk_out_tmp{
+        lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
+    masked_qk_out = std::move(masked_qk_out_tmp);
+    op mask_add_tmp{
+        op_id++,
+        op::kind::Add,
+        {scaled_qk_out, attention_mask.value()},
+        {masked_qk_out.value()},
+        "mask_add"};
+    mask_add = std::move(mask_add_tmp);
+  }
+
+  op softmax{op_id++, op::kind::SoftMax, "softmax"};
   softmax.set_attr<int64_t>(op::attr::axis, -1);
 
   logical_tensor softmax_out{
       lt_id++, dtype, qk_output_shape, logical_tensor::layout_type::strided};
-  if (apply_mask_before_scale) {
-    softmax.add_input(masked_qk_out);
+  if (apply_mask_before_scale && !has_bool_mask) {
+    softmax.add_input(masked_qk_out.value());
+  } else if (has_bool_mask) {
+    softmax.add_input(selected_out.value());
   } else {
     softmax.add_input(scaled_qk_out);
   }
@@ -147,7 +182,7 @@ std::vector<partition> graph_building_and_partitioning(
       lt_id++, dtype, q_input_shape, output.strides().vec()};
 
   op matmul_v{
-      4,
+      op_id++,
       op::kind::MatMul,
       {softmax_out, value_input},
       {matmul_v_out},
@@ -157,8 +192,10 @@ std::vector<partition> graph_building_and_partitioning(
   graph g(ekind);
   g.add_op(matmul_qk);
   g.add_op(scale_div);
-  if (apply_mask_before_scale) {
-    g.add_op(mask_add);
+  if (mask_add.has_value()) {
+    g.add_op(mask_add.value());
+  } else if (select_mask.has_value()) {
+    g.add_op(select_mask.value());
   }
   g.add_op(softmax);
   g.add_op(matmul_v);
@@ -183,7 +220,7 @@ void gpu_float_sdpa_with_cache(
     bool query_requires_transpose = false,
     bool key_requires_transpose_twice = false,
     bool key_requires_transpose_once = false,
-    bool value_requires_transpose = false,
+    bool has_bool_mask = false,
     bool apply_mask_before_scale = false,
     bool choose_causal_mask_over_attn_score = false) {
   auto eng = xpu::oneDNN::GpuEngineManager::Instance().get_engine(
@@ -196,6 +233,15 @@ void gpu_float_sdpa_with_cache(
       {},
       1 / softmax_scale,
       TensorOptions().dtype(c10::ScalarType::Half).device(DeviceType::XPU));
+
+  c10::optional<Tensor> negative_inf = c10::nullopt;
+  if (has_bool_mask) {
+    Tensor negative_inf_tmp = full(
+        attn_mask.sizes(),
+        -std::numeric_limits<double>::infinity(),
+        TensorOptions().dtype(c10::ScalarType::Half).device(DeviceType::XPU));
+    negative_inf = std::move(negative_inf_tmp);
+  }
 
   // cache key creation
   // patternID is determined on the basis of the arguments provided
@@ -217,7 +263,7 @@ void gpu_float_sdpa_with_cache(
   patternID.set(pos++, query_requires_transpose);
   patternID.set(pos++, key_requires_transpose_twice);
   patternID.set(pos++, key_requires_transpose_once);
-  patternID.set(pos++, value_requires_transpose);
+  patternID.set(pos++, has_bool_mask);
   patternID.set(pos++, apply_mask_before_scale);
   patternID.set(pos++, choose_causal_mask_over_attn_score);
   // first check cache
@@ -264,7 +310,7 @@ void gpu_float_sdpa_with_cache(
           query_requires_transpose,
           key_requires_transpose_twice,
           key_requires_transpose_once,
-          value_requires_transpose,
+          has_bool_mask,
           apply_mask_before_scale,
           choose_causal_mask_over_attn_score);
 
@@ -293,11 +339,21 @@ void gpu_float_sdpa_with_cache(
         inputs[2],
         eng,
         softmax_scale1);
-    if (apply_mask_before_scale) {
+    if (apply_mask_before_scale && !has_bool_mask) {
       allocate_sycl_graph_mem(
           compiledPartitionEntry.inputLLGATensors_, inputs[3], eng, attn_mask);
       allocate_sycl_graph_mem(
           compiledPartitionEntry.inputLLGATensors_, inputs[4], eng, value);
+    } else if (has_bool_mask) {
+      allocate_sycl_graph_mem(
+          compiledPartitionEntry.inputLLGATensors_, inputs[3], eng, attn_mask);
+      allocate_sycl_graph_mem(
+          compiledPartitionEntry.inputLLGATensors_,
+          inputs[4],
+          eng,
+          negative_inf.value());
+      allocate_sycl_graph_mem(
+          compiledPartitionEntry.inputLLGATensors_, inputs[5], eng, value);
     }
     allocate_sycl_graph_mem(
         compiledPartitionEntry.inputLLGATensors_, inputs[3], eng, value);
@@ -322,9 +378,15 @@ void gpu_float_sdpa_with_cache(
     allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[1], eng, key);
     allocate_sycl_graph_mem(
         cp.inputLLGATensors_, inputs[2], eng, softmax_scale1);
-    if (apply_mask_before_scale) {
+    if (apply_mask_before_scale && !has_bool_mask) {
       allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[3], eng, attn_mask);
       allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[4], eng, value);
+
+    } else if (has_bool_mask) {
+      allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[3], eng, attn_mask);
+      allocate_sycl_graph_mem(
+          cp.inputLLGATensors_, inputs[4], eng, negative_inf.value());
+      allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[5], eng, value);
     }
     allocate_sycl_graph_mem(cp.inputLLGATensors_, inputs[3], eng, value);
     allocate_sycl_graph_mem(cp.outputLLGATensors_, outputs[0], eng, output);
@@ -347,7 +409,7 @@ void gpu_float_sdpa(
     bool query_requires_transpose = false,
     bool key_requires_transpose_twice = false,
     bool key_requires_transpose_once = false,
-    bool value_requires_transpose = false,
+    bool has_bool_mask = false,
     bool apply_mask_before_scale = false,
     bool choose_causal_mask_over_attn_score = false) {
   auto eng = xpu::oneDNN::GpuEngineManager::Instance().get_engine(
@@ -360,6 +422,15 @@ void gpu_float_sdpa(
       {},
       1 / softmax_scale,
       TensorOptions().dtype(c10::ScalarType::Half).device(DeviceType::XPU));
+
+  c10::optional<Tensor> negative_inf = c10::nullopt;
+  if (has_bool_mask) {
+    Tensor negative_inf_tmp = full(
+        attn_mask.sizes(),
+        -std::numeric_limits<double>::infinity(),
+        TensorOptions().dtype(c10::ScalarType::Half).device(DeviceType::XPU));
+    negative_inf = std::move(negative_inf_tmp);
+  }
 
   if (query.scalar_type() == c10::ScalarType::Float) {
     dtype = data_type::f32;
@@ -386,7 +457,7 @@ void gpu_float_sdpa(
       query_requires_transpose,
       key_requires_transpose_twice,
       key_requires_transpose_once,
-      value_requires_transpose,
+      has_bool_mask,
       apply_mask_before_scale,
       choose_causal_mask_over_attn_score);
 
@@ -405,9 +476,14 @@ void gpu_float_sdpa(
   allocate_sycl_graph_mem(inputs_ts, inputs[1], eng, key);
   allocate_sycl_graph_mem(inputs_ts, inputs[2], eng, softmax_scale1);
 
-  if (apply_mask_before_scale) {
+  if (apply_mask_before_scale && !has_bool_mask) {
     allocate_sycl_graph_mem(inputs_ts, inputs[3], eng, attn_mask);
     allocate_sycl_graph_mem(inputs_ts, inputs[4], eng, value);
+
+  } else if (has_bool_mask) {
+    allocate_sycl_graph_mem(inputs_ts, inputs[3], eng, attn_mask);
+    allocate_sycl_graph_mem(inputs_ts, inputs[4], eng, negative_inf.value());
+    allocate_sycl_graph_mem(inputs_ts, inputs[5], eng, value);
   }
   allocate_sycl_graph_mem(inputs_ts, inputs[3], eng, value);
   allocate_sycl_graph_mem(outputs_ts, outputs[0], eng, output);
@@ -436,7 +512,7 @@ inline Tensor _scaled_dot_product_onednn_graph_dnnl_impl(
   bool query_requires_transpose = false;
   bool key_requires_transpose_twice = false;
   bool key_requires_transpose_once = true;
-  bool value_requires_transpose = false;
+  bool has_bool_mask = false;
   bool apply_mask_before_scale = false;
   bool choose_causal_mask_over_attn_score = false;
 
@@ -446,6 +522,9 @@ inline Tensor _scaled_dot_product_onednn_graph_dnnl_impl(
       attn_mask.has_value() ? attn_mask.value() : at::empty_like(_query);
   if (attn_mask.has_value()) {
     apply_mask_before_scale = true;
+  }
+  if (attn_mask_final.dtype() == at::kBool) {
+    has_bool_mask = true;
   }
 
   const char* enable_onednn_graph_cache =
@@ -468,7 +547,7 @@ inline Tensor _scaled_dot_product_onednn_graph_dnnl_impl(
         query_requires_transpose,
         key_requires_transpose_twice,
         key_requires_transpose_once,
-        value_requires_transpose,
+        has_bool_mask,
         apply_mask_before_scale,
         choose_causal_mask_over_attn_score);
   } else {
@@ -487,7 +566,7 @@ inline Tensor _scaled_dot_product_onednn_graph_dnnl_impl(
         query_requires_transpose,
         key_requires_transpose_twice,
         key_requires_transpose_once,
-        value_requires_transpose,
+        has_bool_mask,
         apply_mask_before_scale,
         choose_causal_mask_over_attn_score);
   }
