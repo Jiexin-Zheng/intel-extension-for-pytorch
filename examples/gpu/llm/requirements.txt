@@ -5,7 +5,7 @@ unzip
 datasets
 sentencepiece
 diffusers
-mpi4py
+#mpi4py
 protobuf==3.20.3
 lm_eval==0.4.2
 huggingface_hub
